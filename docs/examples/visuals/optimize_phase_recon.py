@@ -1,4 +1,6 @@
+import os
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
 import napari
@@ -10,6 +12,7 @@ import torch
 # from biahub.settings import StitchSettings
 from iohub import open_ome_zarr
 from iohub.ngff import TransformationMeta
+from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.tensorboard import SummaryWriter
 
 from waveorder import optics, util
@@ -150,6 +153,10 @@ def prepare_optimizer(
     return optimization_params, optimizer
 
 
+def _profile_ctx(name: str, enabled: bool):
+    return record_function(name) if enabled else nullcontext()
+
+
 def optimize_tile(
     zyx_tile: torch.Tensor,
     recon_args: dict,
@@ -157,6 +164,9 @@ def optimize_tile(
     tb_writer: SummaryWriter,
     num_iterations: int = 10,
     device: torch.device | str | None = None,
+    enable_profiler: bool = False,
+    profiler_output_dir: str = "./profiler_logs",
+    profiler_format: str = "chrome",  # "chrome" or "tensorboard"
 ) -> torch.Tensor:
 
     start_time = time.time()
@@ -177,29 +187,73 @@ def optimize_tile(
         optimizable_params, device=device
     )
 
-    for step in range(num_iterations):
-
-        # Update params
-        for name, param in optimization_params.items():
-            recon_args[name] = param
-
-        # Run reconstruction and compute loss
-        yx_recon = run_reconstruction(zyx_tile, recon_args)
-        loss = -compute_midband_power(
-            yx_recon,
-            NA_det=0.15,
-            lambda_ill=recon_args["wavelength_illumination"],
-            pixel_size=recon_args["yx_pixel_size"],
-            band=(0.1, 0.2),
+    if enable_profiler:
+        os.makedirs(profiler_output_dir, exist_ok=True)
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+        trace_handler = (
+            None
+            if profiler_format == "chrome"
+            else torch.profiler.tensorboard_trace_handler(profiler_output_dir)
         )
+        profiler_ctx = profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=0, warmup=1, active=2, repeat=1
+            ),
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        )
+    else:
+        profiler_ctx = nullcontext()
 
-        # Update optimizer
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+    with profiler_ctx as prof:
+        for step in range(num_iterations):
+            with _profile_ctx("optimization_step", enable_profiler):
+                with _profile_ctx("update_params", enable_profiler):
+                    for name, param in optimization_params.items():
+                        recon_args[name] = param
 
-        log_optimization_progress(
-            step, optimization_params, loss, tb_writer, recon_args, yx_recon
+                with _profile_ctx("reconstruction", enable_profiler):
+                    yx_recon = run_reconstruction(zyx_tile, recon_args)
+
+                with _profile_ctx("compute_loss", enable_profiler):
+                    loss = -compute_midband_power(
+                        yx_recon,
+                        NA_det=0.15,
+                        lambda_ill=recon_args["wavelength_illumination"],
+                        pixel_size=recon_args["yx_pixel_size"],
+                        band=(0.1, 0.2),
+                    )
+
+                with _profile_ctx("optimizer_step", enable_profiler):
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                log_optimization_progress(
+                    step,
+                    optimization_params,
+                    loss,
+                    tb_writer,
+                    recon_args,
+                    yx_recon,
+                )
+
+            if enable_profiler:
+                prof.step()
+
+    if enable_profiler and profiler_format == "chrome":
+        trace_file = os.path.join(profiler_output_dir, "profiler_trace.json")
+        prof.export_chrome_trace(trace_file)
+        print(f"Chrome trace saved to: {trace_file}")
+        print(
+            "View the trace by opening chrome://tracing in Chrome/Edge "
+            "and loading the file."
         )
 
     yx_recon = yx_recon.detach()
@@ -229,9 +283,14 @@ NUM_TILES = (6, 6)
 OVERLAP_FRACTION = 0.2
 
 # OPTIMIZATION
-NUM_ITERATIONS = 10
+NUM_ITERATIONS = 50
 LOGS_DIR = "./runs"
 LOGGING = False
+PROFILING = True  # Set to True to enable torch profiler
+PROFILER_LOGS_DIR = "./profiler_logs"
+PROFILER_FORMAT = (
+    "chrome"  # "chrome" (JSON, no tensorboard needed) or "tensorboard"
+)
 FIXED_PARAMS = {
     "wavelength_illumination": 0.450,
     "index_of_refraction_media": 1.0,
@@ -282,6 +341,14 @@ for key in selected_keys:
     recon_args["yx_pixel_size"] = y_scale
     recon_args["z_scale"] = z_scale
 
+    if PROFILING:
+        profiler_tile_dir = (
+            f"{PROFILER_LOGS_DIR}/tile_{key.replace('/', '_')}_{timestamp}"
+        )
+        print(f"Profiler traces will be saved to: {profiler_tile_dir}")
+    else:
+        profiler_tile_dir = PROFILER_LOGS_DIR
+
     initial_recon = run_reconstruction(zyx_tile, recon_args)
     optimized_recon = optimize_tile(
         zyx_tile,
@@ -289,6 +356,9 @@ for key in selected_keys:
         OPTIMIZABLE_PARAMS,
         tb_writer,
         num_iterations=NUM_ITERATIONS,
+        enable_profiler=PROFILING,
+        profiler_output_dir=profiler_tile_dir,
+        profiler_format=PROFILER_FORMAT,
     )
     if tb_writer is not None:
         tb_writer.close()
