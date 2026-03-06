@@ -187,10 +187,12 @@ def optimize_tile(
             step, optimization_params, loss, tb_writer, recon_args, yx_recon
         )
 
+    yx_recon = yx_recon.detach()
+    torch.cuda.synchronize()
+
     end_time = time.time()
     print(f"Optimization time: {end_time - start_time:.2f} seconds")
-
-    return yx_recon.detach()
+    return yx_recon
 
 
 # === Configuration ===
@@ -205,7 +207,7 @@ OUTPUT_CHANNEL_NAME = "recon"
 
 # TILING
 STITCH_CONFIG_PATH = "./stitch_config.yaml"
-NUM_TILES = (6, 6)
+NUM_TILES = (2, 2)
 OVERLAP_FRACTION = 0.2
 
 # OPTIMIZATION
