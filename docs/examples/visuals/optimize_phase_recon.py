@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 
 import napari
@@ -86,6 +87,7 @@ def log_optimization_progress(
     recon_args: dict,
     yx_recon: torch.Tensor,
 ) -> None:
+    return
     # Print progress
     print(f"Step {step + 1}/{NUM_ITERATIONS}")
     for name, param in optimization_params.items():
@@ -123,13 +125,14 @@ def log_optimization_progress(
 
 def prepare_optimizer(
     optimizable_params: dict[str, tuple[bool, float, float]],
+    device: torch.device,
 ) -> tuple[dict[str, torch.nn.Parameter], torch.optim.Optimizer]:
     optimization_params: dict[str, torch.nn.Parameter] = {}
     optimizer_config = []
     for name, (enabled, initial, lr) in optimizable_params.items():
         if enabled:
             param = torch.nn.Parameter(
-                torch.tensor([initial], device="cpu"), requires_grad=True
+                torch.tensor([initial], device=device), requires_grad=True
             )
             optimization_params[name] = param
             optimizer_config.append({"params": [param], "lr": lr})
@@ -145,7 +148,19 @@ def optimize_tile(
     tb_writer: SummaryWriter,
     num_iterations: int = 10,
 ) -> torch.Tensor:
-    optimization_params, optimizer = prepare_optimizer(optimizable_params)
+    start_time = time.time()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    zyx_tile = zyx_tile.to(device)
+    optimization_params = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in optimizable_params.items()
+    }
+    torch.set_default_device(device)
+
+    optimization_params, optimizer = prepare_optimizer(
+        optimizable_params, device
+    )
 
     for step in range(num_iterations):
 
@@ -172,6 +187,9 @@ def optimize_tile(
             step, optimization_params, loss, tb_writer, recon_args, yx_recon
         )
 
+    end_time = time.time()
+    print(f"Optimization time: {end_time - start_time:.2f} seconds")
+
     return yx_recon.detach()
 
 
@@ -191,7 +209,7 @@ NUM_TILES = (6, 6)
 OVERLAP_FRACTION = 0.2
 
 # OPTIMIZATION
-NUM_ITERATIONS = 10
+NUM_ITERATIONS = 50
 LOGS_DIR = "./runs"
 FIXED_PARAMS = {
     "wavelength_illumination": 0.450,
@@ -257,10 +275,12 @@ for key in selected_keys:
     scale = [z_scale, y_scale, x_scale]
     viewer = napari.Viewer()
     viewer.add_image(
-        initial_recon.numpy()[None], name=f"initial-{key}", scale=scale
+        initial_recon.cpu().numpy()[None], name=f"initial-{key}", scale=scale
     )
     viewer.add_image(
-        optimized_recon.numpy()[None], name=f"optimized-{key}", scale=scale
+        optimized_recon.cpu().numpy()[None],
+        name=f"optimized-{key}",
+        scale=scale,
     )
     viewer.add_image(zyx_tile, name=f"tile-{key}", scale=scale)
 
@@ -268,7 +288,7 @@ for key in selected_keys:
     pos = output_store.create_position(*key.split("/"))
     pos.create_image(
         "0",
-        optimized_recon[None, None, None].numpy(),
+        optimized_recon[None, None, None].cpu().numpy(),
         transform=[TransformationMeta(type="scale", scale=[1, 1] + scale)],
     )
     input("Press Enter to continue...")
