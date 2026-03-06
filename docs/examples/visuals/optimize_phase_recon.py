@@ -115,11 +115,11 @@ def log_optimization_progress(
     )
     tb_writer.add_image(
         "Illumination Pupil",
-        torch.fft.fftshift(pupil).detach().numpy()[None],
+        torch.fft.fftshift(pupil).detach().cpu().numpy()[None],
         step,
     )
     tb_writer.add_image(
-        "Reconstructed Phase", yx_recon.detach().numpy()[None], step
+        "Reconstructed Phase", yx_recon.detach().cpu().numpy()[None], step
     )
 
 
@@ -148,6 +148,8 @@ def optimize_tile(
     tb_writer: SummaryWriter,
     num_iterations: int = 10,
 ) -> torch.Tensor:
+
+    torch.cuda.synchronize()
     start_time = time.time()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -211,7 +213,7 @@ NUM_TILES = (2, 2)
 OVERLAP_FRACTION = 0.2
 
 # OPTIMIZATION
-NUM_ITERATIONS = 50
+NUM_ITERATIONS = 10
 LOGS_DIR = "./runs"
 FIXED_PARAMS = {
     "wavelength_illumination": 0.450,
